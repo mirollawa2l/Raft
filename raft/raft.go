@@ -77,7 +77,12 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	return rf.currentTerm, rf.role == Leader
+	term := rf.currentTerm
+
+	// A killed server should not report leadership
+	isLeader := rf.role == Leader && !rf.killed()
+
+	return term, isLeader
 }
 
 // example RequestVote RPC arguments structure.

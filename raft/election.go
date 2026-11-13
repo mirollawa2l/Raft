@@ -167,3 +167,9 @@ func (rf *Raft) startElection() {
 		}(peer)
 	}
 }
+
+// TEMPORARY: Remove when Person C implements this function.
+func (rf *Raft) onBecomeLeaderLocked() {
+	// Person C will initialize leader state
+	// and arrange for heartbeats here.
+}
