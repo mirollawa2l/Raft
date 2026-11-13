@@ -21,6 +21,8 @@ import (
 	"sync"
 
 	"lab2raft/labrpc"
+	"sync/atomic"
+	"time"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -38,12 +40,29 @@ type LogEntry struct {
 	Term    int
 }
 
+type Role int
+
+const (
+	Follower Role = iota
+	Candidate
+	Leader
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu    sync.Mutex          // Lock to protect shared access to this peer's state
 	peers []*labrpc.ClientEnd // RPC end points of all peers
 	me    int                 // this peer's index into peers[]
 
+	currentTerm int  //Which election term the server currently knows
+	votedFor    int  //Which candidate received this server's vote in that term
+	role        Role //Follower, candidate, or leader
+
+	electionDeadline time.Time //The next time an election should begin if no valid heartbeat/vote reset occurs
+	dead             int32     //Whether the Raft instance should stop its background work
+
+	log     []LogEntry    //Entries used for candidate log-freshness checks
+	applyCh chan ApplyMsg //Channel used by Person C to deliver committed commands
 	// Your data here (3A, 3B).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -53,28 +72,81 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	//protects the shared state from concurrent modifications by election go routine
+	//modifying current term/ role while tester calls get state
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	var term int
-	var isleader bool
-	// Your code here (3A).
-	return term, isleader
+	return rf.currentTerm, rf.role == Leader
 }
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Deny the vote by default
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
+
+	// Ignore work after shutdown
+	if rf.killed() {
+		return
+	}
+
+	// Higher term: become follower
+	if args.Term > rf.currentTerm {
+		rf.stepDownLocked(args.Term)
+	}
+
+	// Reply with our latest term
+	reply.Term = rf.currentTerm
+
+	// Reject an outdated candidate
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// Get our latest log entry
+	myLastIndex := len(rf.log) - 1
+	myLastTerm := rf.log[myLastIndex].Term
+
+	// Candidate's log must be sufficiently up to date
+	freshEnough := args.LastLogTerm > myLastTerm ||
+		(args.LastLogTerm == myLastTerm &&
+			args.LastLogIndex >= myLastIndex)
+
+	// Cannot vote for two different candidates in one term
+	canVote := rf.votedFor == -1 ||
+		rf.votedFor == args.CandidateID
+
+	// Grant the vote only when both conditions hold
+	if canVote && freshEnough {
+		rf.votedFor = args.CandidateID
+		reply.VoteGranted = true
+
+		// Prevent immediately starting a competing election
+		rf.resetElectionTimerLocked()
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -153,6 +225,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	//ensures safe access to the shutdown flag
+	atomic.StoreInt32(&rf.dead, 1)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -168,6 +242,24 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.me = me
 
 	// Your initialization code here (3A, 3B).
+	// Initialize election state
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.role = Follower
+
+	// Dummy entry at log index zero
+	rf.log = []LogEntry{{Term: 0}}
+
+	// Save channel for Person C's applier
+	rf.applyCh = applyCh
+
+	// Choose initial randomized election deadline
+	rf.resetElectionTimerLocked()
+
+	// Monitor elections concurrently
+	go rf.electionTicker()
+
+	// Person C adds leader/applier setup as required
 
 	return rf
 }
