@@ -54,18 +54,22 @@ type Raft struct {
 	peers []*labrpc.ClientEnd // RPC end points of all peers
 	me    int                 // this peer's index into peers[]
 
-	currentTerm int  //Which election term the server currently knows
-	votedFor    int  //Which candidate received this server's vote in that term
-	role        Role //Follower, candidate, or leader
+	currentTerm int  // Which election term the server currently knows
+	votedFor    int  // Which candidate received this server's vote in that term
+	role        Role // Follower, candidate, or leader
 
-	electionDeadline time.Time //The next time an election should begin if no valid heartbeat/vote reset occurs
-	dead             int32     //Whether the Raft instance should stop its background work
+	electionDeadline time.Time // The next time an election should begin if no valid heartbeat/vote reset occurs
+	dead             int32     // Whether the Raft instance should stop its background work
 
-	log     []LogEntry    //Entries used for candidate log-freshness checks
-	applyCh chan ApplyMsg //Channel used by Person C to deliver committed commands
-	// Your data here (3A, 3B).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	log         []LogEntry // Log entries
+	commitIndex int        // Index of highest log entry known to be committed
+	lastApplied int        // Index of highest log entry applied to state machine
+
+	// Leader state (reinitialized after election)
+	nextIndex  []int // For each server, index of the next log entry to send to that server
+	matchIndex []int // For each server, index of highest log entry known to be replicated on server
+
+	applyCh chan ApplyMsg // Channel used to deliver committed commands
 
 }
 
@@ -155,15 +159,102 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesArgs struct {
-	// Your data here (3A, 3B).
+	Term         int        // Leader's term
+	LeaderId     int        // So follower can redirect clients
+	PrevLogIndex int        // Index of log entry immediately preceding new ones
+	PrevLogTerm  int        // Term of prevLogIndex entry
+	Entries      []LogEntry // Log entries to store
+	LeaderCommit int        // Leader's commitIndex
 }
 
 type AppendEntriesReply struct {
-	// Your data here (3A, 3B).
+	Term          int  // CurrentTerm, for leader to update itself
+	Success       bool // True if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictTerm  int  // Term of the conflicting entry if any (optimization)
+	ConflictIndex int  // First index of that conflicting term in follower's log (optimization)
+
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Set default reply values
+	reply.Success = false
+	reply.Term = rf.currentTerm
+
+	// Ignore RPCs if server is dead
+	if rf.killed() {
+		return
+	}
+
+	// 1. Reply false if term < currentTerm (§5.1)
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// If RPC request term > currentTerm, or if we are candidate/leader, step down to follower
+	if args.Term > rf.currentTerm || rf.role != Follower {
+		rf.currentTerm = args.Term
+		rf.role = Follower
+		rf.votedFor = -1
+	}
+
+	// Reset election timeout since we heard from a valid leader
+	rf.resetElectionTimerLocked()
+	reply.Term = rf.currentTerm
+
+	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	lastLogIndex := len(rf.log) - 1
+	if args.PrevLogIndex > lastLogIndex {
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = lastLogIndex + 1
+		return
+	}
+
+	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		// Find the first index of ConflictTerm to optimize backtracking
+		conflictIndex := args.PrevLogIndex
+		for conflictIndex > 0 && rf.log[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex--
+		}
+		reply.ConflictIndex = conflictIndex
+		return
+	}
+
+	// 3. If an existing entry conflicts with a new one (same index but different terms),
+	// delete the existing entry and all that follow it (§5.3)
+	// 4. Append any new entries not already in the log
+	entriesIndex := 0
+	currIndex := args.PrevLogIndex + 1
+
+	for entriesIndex < len(args.Entries) {
+		incoming := args.Entries[entriesIndex]
+		if currIndex < len(rf.log) {
+			if rf.log[currIndex].Term != incoming.Term {
+				rf.log = rf.log[:currIndex]
+				rf.log = append(rf.log, incoming)
+			}
+		} else {
+			rf.log = append(rf.log, incoming)
+		}
+		currIndex++
+		entriesIndex++
+	}
+
+	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) (§5.3)
+	if args.LeaderCommit > rf.commitIndex {
+		lastNewIndex := len(rf.log) - 1
+		if args.LeaderCommit < lastNewIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastNewIndex
+		}
+		// Coordinate with Student 3's applier mechanism if applicable (e.g., signal condition variable or channel)
+	}
+
+	reply.Success = true
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -267,4 +358,15 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	// Person C adds leader/applier setup as required
 
 	return rf
+}
+
+// lastLogIndexTerm returns the index and term of the last entry in the log.
+// Assumes rf.mu is held by the caller.
+func (rf *Raft) lastLogIndexTerm() (int, int) {
+	if len(rf.log) == 0 {
+		return 0, 0
+	}
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+	return lastIndex, lastTerm
 }
