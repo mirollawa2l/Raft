@@ -69,9 +69,12 @@ type Raft struct {
 	nextIndex  []int // For each server, index of the next log entry to send to that server
 	matchIndex []int // For each server, index of highest log entry known to be replicated on server
 
-	applyCh chan ApplyMsg // Channel used to deliver committed commands
+	applyCh   chan ApplyMsg // Channel used to deliver committed commands
+	applyCond *sync.Cond    // Wakes the applier when commitIndex moves
 
 }
+
+const heartbeatInterval = 120 * time.Millisecond
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -194,11 +197,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// If RPC request term > currentTerm, or if we are candidate/leader, step down to follower
-	if args.Term > rf.currentTerm || rf.role != Follower {
-		rf.currentTerm = args.Term
-		rf.role = Follower
-		rf.votedFor = -1
+	// if args.Term > rf.currentTerm || rf.role != Follower {
+	// 	rf.currentTerm = args.Term
+	// 	rf.role = Follower
+	// 	rf.votedFor = -1
+	// }
+	if args.Term > rf.currentTerm {
+		rf.stepDownLocked(args.Term)
 	}
+	rf.role = Follower
 
 	// Reset election timeout since we heard from a valid leader
 	rf.resetElectionTimerLocked()
@@ -226,35 +233,60 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3. If an existing entry conflicts with a new one (same index but different terms),
 	// delete the existing entry and all that follow it (§5.3)
 	// 4. Append any new entries not already in the log
-	entriesIndex := 0
-	currIndex := args.PrevLogIndex + 1
+	// entriesIndex := 0
+	// currIndex := args.PrevLogIndex + 1
 
-	for entriesIndex < len(args.Entries) {
-		incoming := args.Entries[entriesIndex]
-		if currIndex < len(rf.log) {
-			if rf.log[currIndex].Term != incoming.Term {
-				rf.log = rf.log[:currIndex]
-				rf.log = append(rf.log, incoming)
+	// for entriesIndex < len(args.Entries) {
+	// 	incoming := args.Entries[entriesIndex]
+	// 	if currIndex < len(rf.log) {
+	// 		if rf.log[currIndex].Term != incoming.Term {
+	// 			rf.log = rf.log[:currIndex]
+	// 			rf.log = append(rf.log, incoming)
+	// 		}
+	// 	} else {
+	// 		rf.log = append(rf.log, incoming)
+	// 	}
+	// 	currIndex++
+	// 	entriesIndex++
+	// }
+
+	// // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) (§5.3)
+	// if args.LeaderCommit > rf.commitIndex {
+	// 	lastNewIndex := len(rf.log) - 1
+	// 	if args.LeaderCommit < lastNewIndex {
+	// 		rf.commitIndex = args.LeaderCommit
+	// 	} else {
+	// 		rf.commitIndex = lastNewIndex
+	// 	}
+	// 	// Coordinate with Student 3's applier mechanism if applicable (e.g., signal condition variable or channel)
+	// }
+
+	// reply.Success = true
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx < len(rf.log) {
+			if rf.log[idx].Term == entry.Term {
+				continue
 			}
-		} else {
-			rf.log = append(rf.log, incoming)
+			rf.log = rf.log[:idx]
 		}
-		currIndex++
-		entriesIndex++
+		rf.log = append(rf.log, args.Entries[i:]...)
+		break
 	}
 
-	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) (§5.3)
 	if args.LeaderCommit > rf.commitIndex {
-		lastNewIndex := len(rf.log) - 1
-		if args.LeaderCommit < lastNewIndex {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = lastNewIndex
+		lastNewIndex := args.PrevLogIndex + len(args.Entries)
+		newCommit := args.LeaderCommit
+		if lastNewIndex < newCommit {
+			newCommit = lastNewIndex
 		}
-		// Coordinate with Student 3's applier mechanism if applicable (e.g., signal condition variable or channel)
+		if newCommit > rf.commitIndex {
+			rf.commitIndex = newCommit
+			rf.applyCond.Broadcast()
+		}
 	}
-
 	reply.Success = true
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -306,13 +338,26 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := false
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
+	// Only a live leader accepts commands
+	if rf.killed() || rf.role != Leader {
+		return -1, rf.currentTerm, false
+	}
 
-	return index, term, isLeader
+	// Add the command to our own log first
+	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
+	index := len(rf.log) - 1
+	rf.matchIndex[rf.me] = index
+
+	// With only one server there is nobody else to wait for
+	rf.advanceCommitLocked()
+
+	// Send it out now instead of waiting for the next heartbeat
+	rf.broadcastLocked()
+
+	return index, rf.currentTerm, true
 }
 
 // the tester calls Kill() when a Raft instance won't
@@ -323,6 +368,15 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	//ensures safe access to the shutdown flag
 	atomic.StoreInt32(&rf.dead, 1)
+
+	// Wake up the applier so it can see that we are dead and exit.
+	// We take the lock so the wake-up can't slip in between the
+	// applier's killed() check and its Wait().
+	if rf.applyCond != nil {
+		rf.mu.Lock()
+		rf.applyCond.Broadcast()
+		rf.mu.Unlock()
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -346,8 +400,9 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	// Dummy entry at log index zero
 	rf.log = []LogEntry{{Term: 0}}
 
-	// Save channel for Person C's applier
+	// Save channel for the applier
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// Choose initial randomized election deadline
 	rf.resetElectionTimerLocked()
@@ -355,7 +410,8 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	// Monitor elections concurrently
 	go rf.electionTicker()
 
-	// Person C adds leader/applier setup as required
+	// Hands committed entries to the service, in order
+	go rf.applier()
 
 	return rf
 }
@@ -369,4 +425,214 @@ func (rf *Raft) lastLogIndexTerm() (int, int) {
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
 	return lastIndex, lastTerm
+}
+
+// Called (with rf.mu held) right after we win an election.
+func (rf *Raft) onBecomeLeaderLocked() {
+	n := len(rf.peers)
+	rf.nextIndex = make([]int, n)
+	rf.matchIndex = make([]int, n)
+
+	// Optimistically assume everyone is caught up; the first rejected
+	// AppendEntries will walk nextIndex back if they are not.
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+	}
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+
+	go rf.heartbeatLoop(rf.currentTerm)
+}
+
+// Keeps sending AppendEntries to everyone while we are the leader of this term.
+func (rf *Raft) heartbeatLoop(term int) {
+	for {
+		rf.mu.Lock()
+		if rf.killed() || rf.role != Leader || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		rf.broadcastLocked()
+		rf.mu.Unlock()
+
+		time.Sleep(heartbeatInterval)
+	}
+}
+
+// Starts one sender goroutine per follower. Caller holds rf.mu.
+func (rf *Raft) broadcastLocked() {
+	for peer := range rf.peers {
+		if peer != rf.me {
+			go rf.replicateTo(peer, rf.currentTerm)
+		}
+	}
+}
+
+// Sends one AppendEntries to a single follower and handles the answer.
+// An empty Entries list is just a heartbeat.
+func (rf *Raft) replicateTo(peer int, term int) {
+	rf.mu.Lock()
+	if rf.killed() || rf.role != Leader || rf.currentTerm != term {
+		rf.mu.Unlock()
+		return
+	}
+
+	next := rf.nextIndex[peer]
+	if next < 1 {
+		next = 1
+	}
+	if next > len(rf.log) {
+		next = len(rf.log)
+	}
+	prev := next - 1
+
+	// Copy the entries, the log may change while the RPC is in flight
+	entries := make([]LogEntry, len(rf.log)-next)
+	copy(entries, rf.log[next:])
+
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     rf.me,
+		PrevLogIndex: prev,
+		PrevLogTerm:  rf.log[prev].Term,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+
+	// Never hold the lock during the RPC
+	var reply AppendEntriesReply
+	if !rf.sendAppendEntries(peer, &args, &reply) {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// The world may have changed while we were waiting for the reply
+	if rf.killed() || rf.role != Leader || rf.currentTerm != term {
+		return
+	}
+
+	if reply.Term > rf.currentTerm {
+		rf.stepDownLocked(reply.Term)
+		return
+	}
+
+	if reply.Success {
+		match := args.PrevLogIndex + len(args.Entries)
+		if match > rf.matchIndex[peer] {
+			rf.matchIndex[peer] = match
+		}
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		rf.advanceCommitLocked()
+
+		// Follower is still missing entries (new ones came in meanwhile)
+		if rf.nextIndex[peer] < len(rf.log) {
+			go rf.replicateTo(peer, term)
+		}
+		return
+	}
+
+	// Log mismatch. If nextIndex already moved since we sent this
+	// request, the reply is out of date, so skip it.
+	if rf.nextIndex[peer] != args.PrevLogIndex+1 {
+		return
+	}
+
+	newNext := reply.ConflictIndex
+	if reply.ConflictTerm != -1 {
+		// If we also have entries from the conflicting term, retry just
+		// after our last one. If not, skip that whole term.
+		for i := len(rf.log) - 1; i >= 1; i-- {
+			if rf.log[i].Term == reply.ConflictTerm {
+				newNext = i + 1
+				break
+			}
+			if rf.log[i].Term < reply.ConflictTerm {
+				break
+			}
+		}
+	}
+
+	// Always move backwards, but never below 1
+	if newNext >= rf.nextIndex[peer] {
+		newNext = rf.nextIndex[peer] - 1
+	}
+	if newNext < 1 {
+		newNext = 1
+	}
+	rf.nextIndex[peer] = newNext
+
+	// Try again right away
+	go rf.replicateTo(peer, term)
+}
+
+// Moves commitIndex forward if a majority has an entry. Only entries from
+// the current term are counted (§5.4.2); older ones get committed along
+// with them. Caller holds rf.mu.
+func (rf *Raft) advanceCommitLocked() {
+	if rf.role != Leader {
+		return
+	}
+	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
+		if rf.log[n].Term != rf.currentTerm {
+			break
+		}
+		count := 1 // ourselves
+		for peer := range rf.peers {
+			if peer != rf.me && rf.matchIndex[peer] >= n {
+				count++
+			}
+		}
+		if count*2 > len(rf.peers) {
+			rf.commitIndex = n
+			rf.applyCond.Broadcast()
+			return
+		}
+	}
+}
+
+// Sends committed entries to the service, one at a time and in order.
+// The channel send happens without the lock so we never block the RPC handlers.
+func (rf *Raft) applier() {
+	for {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex && !rf.killed() {
+			rf.applyCond.Wait()
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+
+		var msgs []ApplyMsg
+		for rf.lastApplied < rf.commitIndex && rf.lastApplied+1 < len(rf.log) {
+			rf.lastApplied++
+			msgs = append(msgs, ApplyMsg{
+				Index:   rf.lastApplied,
+				Command: rf.log[rf.lastApplied].Command,
+			})
+		}
+		rf.mu.Unlock()
+
+		for _, msg := range msgs {
+			if !rf.sendApply(msg) {
+				return
+			}
+		}
+	}
+}
+
+// Sends on applyCh but gives up if we get killed while waiting.
+func (rf *Raft) sendApply(msg ApplyMsg) bool {
+	for {
+		select {
+		case rf.applyCh <- msg:
+			return true
+		case <-time.After(100 * time.Millisecond):
+			if rf.killed() {
+				return false
+			}
+		}
+	}
 }
