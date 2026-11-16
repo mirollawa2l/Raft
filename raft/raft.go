@@ -110,6 +110,17 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// lastLogIndexTerm returns the index and term of the last entry in the log.
+// Assumes rf.mu is held by the caller.
+func (rf *Raft) lastLogIndexTerm() (int, int) {
+	if len(rf.log) == 0 {
+		return 0, 0
+	}
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+	return lastIndex, lastTerm
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
@@ -138,9 +149,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// Get our latest log entry
-	myLastIndex := len(rf.log) - 1
-	myLastTerm := rf.log[myLastIndex].Term
+	myLastIndex, myLastTerm := rf.lastLogIndexTerm()
 
 	// Candidate's log must be sufficiently up to date
 	freshEnough := args.LastLogTerm > myLastTerm ||

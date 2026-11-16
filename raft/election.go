@@ -76,8 +76,7 @@ func (rf *Raft) startElection() {
 	rf.resetElectionTimerLocked()
 
 	// 5. Get the candidate's latest log information
-	lastIndex := len(rf.log) - 1
-	lastTerm := rf.log[lastIndex].Term
+	lastIndex, lastTerm := rf.lastLogIndexTerm()
 
 	// 6. Prepare the RequestVote RPC
 	args := RequestVoteArgs{
