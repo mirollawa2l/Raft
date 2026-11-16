@@ -378,6 +378,17 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	return rf
 }
 
+// lastLogIndexTerm returns the index and term of the last entry in the log.
+// Assumes rf.mu is held by the caller.
+func (rf *Raft) lastLogIndexTerm() (int, int) {
+	if len(rf.log) == 0 {
+		return 0, 0
+	}
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+	return lastIndex, lastTerm
+}
+
 // Called (with rf.mu held) right after we win an election.
 func (rf *Raft) onBecomeLeaderLocked() {
 	n := len(rf.peers)
