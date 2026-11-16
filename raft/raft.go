@@ -164,9 +164,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 type AppendEntriesArgs struct {
 	Term         int        // Leader's term
 	LeaderId     int        // So follower can redirect clients
-	PrevLogIndex int        // Index of log entry immediately preceding new ones
-	PrevLogTerm  int        // Term of prevLogIndex entry
-	Entries      []LogEntry // Log entries to store
+	PrevLogIndex int        // Index of log entry immediately before preceding new ones
+	PrevLogTerm  int        // Term of previous entry
+	Entries      []LogEntry // Log entries to store for replication
 	LeaderCommit int        // Leader's commitIndex
 }
 
@@ -183,65 +183,89 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	// Set default reply values
+	//assuming false until lama ne3ml verification
+	//so leader can know the follower's term and update itself if needed
 	reply.Success = false
 	reply.Term = rf.currentTerm
 
-	// Ignore RPCs if server is dead
+	//exit without processing the RPCs if server is dead
 	if rf.killed() {
 		return
 	}
 
 	// 1. Reply false if term < currentTerm (§5.1)
+	//kda older so reject
 	if args.Term < rf.currentTerm {
 		return
 	}
 
+	// if the incoming term is greater than the current term, step down to follower
+	//bnzawed ashan neb2a ehna el leader law howa gy aktar mnena
 	if args.Term > rf.currentTerm {
 		rf.stepDownLocked(args.Term)
 	}
+	//kda kda ehna el leader
 	rf.role = Follower
 
 	// Reset election timeout since we heard from a valid leader
 	rf.resetElectionTimerLocked()
 	reply.Term = rf.currentTerm
 
-	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	// get the index of last entry
 	lastLogIndex := len(rf.log) - 1
+	// kda yeb2a el leader 3ando aktr mnena fa law el prev log index bta3o aktr mnen el last log index bta3na yeb2a feh gap
 	if args.PrevLogIndex > lastLogIndex {
+		//follower too short, tell leader to back up
 		reply.ConflictTerm = -1
+		//follower byhawl yebda2 mn 3and el last log index bta3o
 		reply.ConflictIndex = lastLogIndex + 1
 		return
 	}
-
+	//The previous index is valid (not negative).
+	// //The term at that index is different from the Leader's expected term.
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		//a2ool l leader en feh conflict term w 3ayz a2oolo yebda2 mn feen
 		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 		// Find the first index of ConflictTerm to optimize backtracking
 		conflictIndex := args.PrevLogIndex
+		//backword loop to find the first index of the conflicting term
 		for conflictIndex > 0 && rf.log[conflictIndex-1].Term == reply.ConflictTerm {
 			conflictIndex--
 		}
+		//bnb3ato ll leader 3ashan y3raf yebda2 mn feen
 		reply.ConflictIndex = conflictIndex
 		return
 	}
 
+	//loop through all the entries sent by the leader and check if they match the follower's log
 	for i, entry := range args.Entries {
+		//+1 ashan prevlogindex bta3 el leader awl haga abl the imcoming entries
 		idx := args.PrevLogIndex + 1 + i
+		//check if already exists
 		if idx < len(rf.log) {
+			//check if the term matches, if it does we can skip to the next entry
 			if rf.log[idx].Term == entry.Term {
 				continue
 			}
+			//delete conflicting entry and all that follow it
 			rf.log = rf.log[:idx]
 		}
+		//add any new entries not already in the log
+
 		rf.log = append(rf.log, args.Entries[i:]...)
 		break
 	}
-
+	//commitIndex is the highest log entry that the server knows about
+	//law the leader's commitIndex is greater than the follower's commitIndex, we can update it to the minimum of the two
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
 		newCommit := args.LeaderCommit
 		if lastNewIndex < newCommit {
+			//take the minimum of the two to avoid committing entries that we don't have yet
 			newCommit = lastNewIndex
 		}
+		//update the commitindex
+		//broadcast wakes up the applier goroutine to apply the newly committed entries to the state machine
 		if newCommit > rf.commitIndex {
 			rf.commitIndex = newCommit
 			rf.applyCond.Broadcast()
@@ -378,17 +402,6 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	return rf
 }
 
-// lastLogIndexTerm returns the index and term of the last entry in the log.
-// Assumes rf.mu is held by the caller.
-func (rf *Raft) lastLogIndexTerm() (int, int) {
-	if len(rf.log) == 0 {
-		return 0, 0
-	}
-	lastIndex := len(rf.log) - 1
-	lastTerm := rf.log[lastIndex].Term
-	return lastIndex, lastTerm
-}
-
 // Called (with rf.mu held) right after we win an election.
 func (rf *Raft) onBecomeLeaderLocked() {
 	n := len(rf.peers)
@@ -470,18 +483,13 @@ func (rf *Raft) replicateTo(peer int, term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.killed() {
+	// The world may have changed while we were waiting for the reply
+	if rf.killed() || rf.role != Leader || rf.currentTerm != term {
 		return
 	}
 
-	// A newer term always wins, even if we are no longer leader
 	if reply.Term > rf.currentTerm {
 		rf.stepDownLocked(reply.Term)
-		return
-	}
-
-	// Only then check that this reply belongs to our current leadership
-	if rf.role != Leader || rf.currentTerm != term {
 		return
 	}
 
