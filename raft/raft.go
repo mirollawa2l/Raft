@@ -196,12 +196,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// If RPC request term > currentTerm, or if we are candidate/leader, step down to follower
-	// if args.Term > rf.currentTerm || rf.role != Follower {
-	// 	rf.currentTerm = args.Term
-	// 	rf.role = Follower
-	// 	rf.votedFor = -1
-	// }
 	if args.Term > rf.currentTerm {
 		rf.stepDownLocked(args.Term)
 	}
@@ -230,38 +224,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 3. If an existing entry conflicts with a new one (same index but different terms),
-	// delete the existing entry and all that follow it (§5.3)
-	// 4. Append any new entries not already in the log
-	// entriesIndex := 0
-	// currIndex := args.PrevLogIndex + 1
-
-	// for entriesIndex < len(args.Entries) {
-	// 	incoming := args.Entries[entriesIndex]
-	// 	if currIndex < len(rf.log) {
-	// 		if rf.log[currIndex].Term != incoming.Term {
-	// 			rf.log = rf.log[:currIndex]
-	// 			rf.log = append(rf.log, incoming)
-	// 		}
-	// 	} else {
-	// 		rf.log = append(rf.log, incoming)
-	// 	}
-	// 	currIndex++
-	// 	entriesIndex++
-	// }
-
-	// // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) (§5.3)
-	// if args.LeaderCommit > rf.commitIndex {
-	// 	lastNewIndex := len(rf.log) - 1
-	// 	if args.LeaderCommit < lastNewIndex {
-	// 		rf.commitIndex = args.LeaderCommit
-	// 	} else {
-	// 		rf.commitIndex = lastNewIndex
-	// 	}
-	// 	// Coordinate with Student 3's applier mechanism if applicable (e.g., signal condition variable or channel)
-	// }
-
-	// reply.Success = true
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
 		if idx < len(rf.log) {
@@ -508,13 +470,18 @@ func (rf *Raft) replicateTo(peer int, term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// The world may have changed while we were waiting for the reply
-	if rf.killed() || rf.role != Leader || rf.currentTerm != term {
+	if rf.killed() {
 		return
 	}
 
+	// A newer term always wins, even if we are no longer leader
 	if reply.Term > rf.currentTerm {
 		rf.stepDownLocked(reply.Term)
+		return
+	}
+
+	// Only then check that this reply belongs to our current leadership
+	if rf.role != Leader || rf.currentTerm != term {
 		return
 	}
 
